@@ -28,3 +28,8 @@ class PlanInput(BaseModel):
 class TraceInput(BaseModel):
  name:str=Field(min_length=2,max_length=120)
  plan_id:int
+
+class SweepInput(BaseModel):
+ trace_id:int
+ step_index:int
+ name:str=Field(default='',max_length=160)

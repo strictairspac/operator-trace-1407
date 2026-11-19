@@ -33,37 +33,82 @@ def validate_steps(steps):
  return steps
 
 def checksum(rows):return hashlib.sha256(json.dumps(rows,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+def _apply(rows,step,dataset,reads):
+ before=len(rows);started=time.perf_counter();detail={}
+ if step['op']=='scan':
+  rows=[dict(r) for r in dataset['readings']];reads+=len(rows);detail={'source':'readings','scanned_rows':len(rows)}
+ elif step['op']=='filter':
+  field,cmp,value=step['field'],step['compare'],step['value']
+  def match(row):
+   v=row[field]
+   if cmp=='eq':return v==value
+   if not isinstance(v,(int,float)):raise ValueError('范围比较遇到非数值')
+   return v>=value if cmp=='gte' else v<=value
+  reads+=len(rows);rows=[r for r in rows if match(r)];detail={'predicate':step,'removed_rows':before-len(rows)}
+ elif step['op']=='hash_join':
+  buckets=defaultdict(list)
+  for sensor in dataset['sensors']:buckets[sensor['sensor_id']].append(sensor)
+  joined=[];probes=0
+  for row in rows:
+   probes+=1
+   for sensor in buckets.get(row['sensor_id'],[]):
+    joined.append({**row,**sensor})
+    if len(joined)>MAX_ROWS:raise ValueError('连接结果超过10000行，请缩小输入；未保存部分结果')
+  reads+=len(rows)+len(dataset['sensors']);rows=joined;detail={'build_rows':len(dataset['sensors']),'hash_buckets':len(buckets),'probe_rows':probes,'semantics':'inner join; duplicate right keys retain multiplicity'}
+ elif step['op']=='group':
+  grouped=defaultdict(list);keys=step['keys'];agg=step['aggregate']
+  for row in rows:grouped[tuple(row[k] for k in keys)].append(Decimal(str(row['value'])))
+  reads+=len(rows);rows=[]
+  for key,values in grouped.items():
+   value=len(values) if agg=='count' else float(sum(values)) if agg=='sum' else float(sum(values)/len(values))
+   rows.append({**dict(zip(keys,key)),agg:round(value,6) if isinstance(value,float) else value})
+  rows.sort(key=lambda r:json.dumps(r,sort_keys=True,ensure_ascii=False));detail={'groups':len(rows),'aggregate':agg,'accumulator':'decimal from source string; rounded 6 decimals'}
+ return rows,reads,{'op':step['op'],'input_rows':before,'output_rows':len(rows),'duration_ms':round((time.perf_counter()-started)*1000,4),'detail':detail,'checksum':checksum(rows),'preview':rows[:5]}
+
+def _envelope(trace,rows,reads,duration):
+ return {'operators':trace,'output':rows,'output_rows':len(rows),'checksum':checksum(rows),'row_visits':reads,'duration_ms':round(duration*1000,4),'limits':{'max_readings':2000,'max_sensors':100,'max_join_rows':10000,'max_stages':6},'model':'Python teaching scan/filter/hash join/group engine; PostgreSQL persists business metadata only'}
+
 def execute(dataset,steps):
  validate_steps(steps);rows=[];trace=[];total_started=time.perf_counter();reads=0
  for step in steps:
-  before=len(rows);started=time.perf_counter();detail={}
-  if step['op']=='scan':
-   rows=[dict(r) for r in dataset['readings']];reads+=len(rows);detail={'source':'readings','scanned_rows':len(rows)}
-  elif step['op']=='filter':
-   field,cmp,value=step['field'],step['compare'],step['value']
-   def match(row):
-    v=row[field]
-    if cmp=='eq':return v==value
-    if not isinstance(v,(int,float)):raise ValueError('范围比较遇到非数值')
-    return v>=value if cmp=='gte' else v<=value
-   reads+=len(rows);rows=[r for r in rows if match(r)];detail={'predicate':step,'removed_rows':before-len(rows)}
-  elif step['op']=='hash_join':
-   buckets=defaultdict(list)
-   for sensor in dataset['sensors']:buckets[sensor['sensor_id']].append(sensor)
-   joined=[];probes=0
-   for row in rows:
-    probes+=1
-    for sensor in buckets.get(row['sensor_id'],[]):
-     joined.append({**row,**sensor})
-     if len(joined)>MAX_ROWS:raise ValueError('连接结果超过10000行，请缩小输入；未保存部分结果')
-   reads+=len(rows)+len(dataset['sensors']);rows=joined;detail={'build_rows':len(dataset['sensors']),'hash_buckets':len(buckets),'probe_rows':probes,'semantics':'inner join; duplicate right keys retain multiplicity'}
-  elif step['op']=='group':
-   grouped=defaultdict(list);keys=step['keys'];agg=step['aggregate']
-   for row in rows:grouped[tuple(row[k] for k in keys)].append(Decimal(str(row['value'])))
-   reads+=len(rows);rows=[]
-   for key,values in grouped.items():
-    value=len(values) if agg=='count' else float(sum(values)) if agg=='sum' else float(sum(values)/len(values))
-    rows.append({**dict(zip(keys,key)),agg:round(value,6) if isinstance(value,float) else value})
-   rows.sort(key=lambda r:json.dumps(r,sort_keys=True,ensure_ascii=False));detail={'groups':len(rows),'aggregate':agg,'accumulator':'decimal from source string; rounded 6 decimals'}
-  trace.append({'op':step['op'],'input_rows':before,'output_rows':len(rows),'duration_ms':round((time.perf_counter()-started)*1000,4),'detail':detail,'checksum':checksum(rows),'preview':rows[:5]})
- return {'operators':trace,'output':rows,'output_rows':len(rows),'checksum':checksum(rows),'row_visits':reads,'duration_ms':round((time.perf_counter()-total_started)*1000,4),'limits':{'max_readings':2000,'max_sensors':100,'max_join_rows':10000,'max_stages':6},'model':'Python teaching scan/filter/hash join/group engine; PostgreSQL persists business metadata only'}
+  rows,reads,entry=_apply(rows,step,dataset,reads);trace.append(entry)
+ return _envelope(trace,rows,reads,time.perf_counter()-total_started)
+
+def execute_prefix(dataset,steps,upto):
+ """Materialize the shared prefix once; the sweep re-runs only the selected filter onward."""
+ validate_steps(steps)
+ rows=[];reads=0;trace=[]
+ for step in steps[:upto]:rows,reads,entry=_apply(rows,step,dataset,reads);trace.append(entry)
+ return rows,reads,trace
+
+def execute_from(dataset,steps,rows,reads=0,prefix_trace=None):
+ """Run a suffix from already materialized rows and keep full-plan evidence (minus prefix timing)."""
+ trace=list(prefix_trace or []);total_started=time.perf_counter()
+ for step in steps:
+  rows,reads,entry=_apply(rows,step,dataset,reads);trace.append(entry)
+ return _envelope(trace,rows,reads,time.perf_counter()-total_started)
+
+def sweep_partition(values,compare):
+ """Partition the threshold domain so the kept rows are constant inside each interval.
+
+ Boundaries are the exact field values; each interval is evaluated at a
+ representative threshold using the original gte/lte comparison (inclusive
+ bounds), so boundary values are counted exactly as the normal filter does.
+ """
+ numeric=sorted({v for v in values if isinstance(v,(int,float)) and not isinstance(v,bool)})
+ if compare not in ('gte','lte'):raise ValueError('阈值扫描仅支持gte/lte数值筛选')
+ if not numeric:return [{'lower':None,'upper':None,'lower_inclusive':False,'upper_inclusive':False,'threshold':0}]
+ parts=[]
+ if compare=='gte':
+  # kept = {value >= t}; result changes only just after a data value
+  parts.append({'lower':None,'upper':numeric[0],'lower_inclusive':False,'upper_inclusive':True,'threshold':numeric[0]})
+  for i in range(1,len(numeric)):
+   parts.append({'lower':numeric[i-1],'upper':numeric[i],'lower_inclusive':False,'upper_inclusive':True,'threshold':numeric[i]})
+  parts.append({'lower':numeric[-1],'upper':None,'lower_inclusive':False,'upper_inclusive':False,'threshold':numeric[-1]+1})
+ else:
+  # kept = {value <= t}; result changes only at a data value
+  parts.append({'lower':None,'upper':numeric[0],'lower_inclusive':False,'upper_inclusive':False,'threshold':numeric[0]-1})
+  for i in range(1,len(numeric)):
+   parts.append({'lower':numeric[i-1],'upper':numeric[i],'lower_inclusive':True,'upper_inclusive':False,'threshold':numeric[i-1]})
+  parts.append({'lower':numeric[-1],'upper':None,'lower_inclusive':True,'upper_inclusive':False,'threshold':numeric[-1]})
+ return parts

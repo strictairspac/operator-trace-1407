@@ -6,14 +6,17 @@ from src.models.dataset import Dataset
 from src.models.plan import Plan
 from src.models.trace import Trace
 from src.services.operators import execute
+from src.services import sweeps
 from src.services.audit import log
 q=redis.Redis.from_url(REDIS_URL)
 while True:
  Path('/tmp/worker-heartbeat').touch()
  try:
-  item=q.blpop('operator-traces',timeout=2)
+  item=q.blpop(['operator-sweeps','operator-traces'],timeout=2)
   if not item:continue
-  run_id=int(item[1])
+  kind,run_id=item[0].decode(),int(item[1])
+  if kind=='operator-sweeps':
+   sweeps.run(run_id);continue
   with Session() as s:
    row=s.get(Trace,run_id)
    if not row or row.status!='queued':continue
